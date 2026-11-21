@@ -1,11 +1,13 @@
 package com.custom.nodashbhop.wheel;
 
+import com.custom.nodashbhop.CombinedNetwork;
 import com.custom.nodashbhop.JCraftStandCheck;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.world.entity.player.Player;
 import net.minecraftforge.client.event.RegisterClientCommandsEvent;
@@ -18,14 +20,14 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Core controller for JCraft Ability Wheel v3.2:
- * - Default Cast key: C (now supports HOLDING C for hold-type skills!)
- * - Tap X (< 175ms): Quick-cycle active non-Light abilities
- * - Hold X (>= 175ms): Open transparent PvP Wheel while preserving crouch (Shift never forces player to stand up!)
- * - Mandom special support: 2 halves (Countdown + Rewind mapped to Barrage), Rewind icon in center, normal M1 attack untouched
- * - Default to STAND whenever player has a Stand; switching to SPEC auto-desummons Stand before firing Spec move if needed
- * - Casting Stand move with C when Stand is unsummoned fires immediately without waiting for manual summon
- * - Spec wheel filters out Utility and missing/unusable moves so playable Spec skills fill the whole wheel
+ * Core controller for JCraft Ability Wheel v3.3 (built directly against JCraft 0.18.2 internals):
+ * - Direct server-side execution via CombinedNetwork.sendWheelCast:
+ *     * Fixes SPECIAL1, SPECIAL2, SPECIAL3 100% (works even if unbound in Controls!)
+ *     * Spec priority: executes JSpec.initMove directly even while Stand is summoned!
+ *     * Instant Stand cast: calls JCraft.summon(player) + stand.initMove in the EXACT same server tick!
+ *     * Holdable C key: sends hold/release packets cleanly!
+ * - Mandom exact mapping: 2 halves = Countdown (UTILITY, mandom/utility.png) + Rewind (ULTIMATE, mandom/ult.png),
+ *   center icon = mandom/ult.png (Rewind), normal M1 left-click untouched!
  */
 public class WheelController {
     public static final KeyMapping KEY_CAST = new KeyMapping(
@@ -43,6 +45,10 @@ public class WheelController {
     );
 
     private static final long HOLD_THRESHOLD_MS = 175L;
+    private static final ResourceLocation MANDOM_REWIND_ICON =
+            new ResourceLocation("jcraft", "textures/gui/ability_icons/mandom/ult.png");
+    private static final ResourceLocation MANDOM_COUNTDOWN_ICON =
+            new ResourceLocation("jcraft", "textures/gui/ability_icons/mandom/utility.png");
 
     public final MoveSlotData[] slots = new MoveSlotData[8];
     public final JCraftCooldownTracker cooldowns = new JCraftCooldownTracker();
@@ -64,18 +70,8 @@ public class WheelController {
 
     // C holdable cast tracking
     private boolean castWasDown = false;
-    private boolean holdingCastKey = false;
-
-    // Active JCraft simulated keybind hold
-    private KeyMapping activeCastKey = null;
-    private boolean activeCastForceShift = false;
-    private int activeCastMinTicksRemaining = 0;
-
-    // 1-tick handoff after instant summon/desummon
-    private WheelSlot pendingMoveSlot = null;
-    private boolean pendingMoveShift = false;
-    private boolean pendingMoveHoldWhileC = false;
-    private int pendingDelayTicks = 0;
+    private WheelSlot heldCastSlot = null;
+    private boolean heldCastSpecMode = false;
 
     public WheelController() {
         for (WheelSlot ws : WheelSlot.values()) {
@@ -92,55 +88,58 @@ public class WheelController {
 
     /**
      * Returns ONLY the active non-Light slots for the wheel:
-     * - Mandom: strictly 2 halves (Countdown on SPECIAL1 + Rewind on BARRAGE)
-     * - Spec: strictly excludes UTILITY and any slot without a real move/icon
-     * - Stand: excludes LIGHT (M1) and any missing slots so remaining moves expand across 360 deg
+     * - Mandom: strictly 2 halves — Countdown (UTILITY) & Rewind (ULTIMATE) with real mandom PNG icons!
+     * - Spec: strictly excludes UTILITY and any slot without a real icon/move
+     * - Stand: excludes LIGHT (M1) and any missing slots so remaining moves expand evenly across 360 deg
      */
     public List<MoveSlotData> getActiveSlots() {
         List<MoveSlotData> active = new ArrayList<>();
 
         if (isCurrentMandom()) {
-            MoveSlotData countdown = slots[WheelSlot.SPECIAL1.index];
-            MoveSlotData rewind = slots[WheelSlot.BARRAGE.index];
-            if (countdown.normalName == null || countdown.normalName.equals(WheelSlot.SPECIAL1.defaultName)) {
+            MoveSlotData countdown = slots[WheelSlot.UTILITY.index];
+            MoveSlotData rewind = slots[WheelSlot.ULTIMATE.index];
+            countdown.present = true;
+            rewind.present = true;
+            if (countdown.normalName == null || countdown.normalName.equals(WheelSlot.UTILITY.defaultName)) {
                 countdown.normalName = "Countdown";
             }
-            if (rewind.normalName == null || rewind.normalName.equals(WheelSlot.BARRAGE.defaultName)) {
+            if (rewind.normalName == null || rewind.normalName.equals(WheelSlot.ULTIMATE.defaultName)) {
                 rewind.normalName = "Rewind";
             }
-            // Pull icon from ULTIMATE if Mandom's Rewind icon was indexed under ULT
-            if (rewind.normalIcon == null && slots[WheelSlot.ULTIMATE.index].normalIcon != null) {
-                rewind.normalIcon = slots[WheelSlot.ULTIMATE.index].normalIcon;
+            if (countdown.normalDescription == null || countdown.normalDescription.isEmpty()) {
+                countdown.normalDescription = "Saves position data of all entities in a 64 block radius for 30 seconds. Must be active to use Rewind.";
             }
+            if (rewind.normalDescription == null || rewind.normalDescription.isEmpty()) {
+                rewind.normalDescription = "Returns all entities to their saved positions. Requires Countdown to be active.";
+            }
+            if (countdown.normalIcon == null) countdown.normalIcon = MANDOM_COUNTDOWN_ICON;
+            if (rewind.normalIcon == null) rewind.normalIcon = MANDOM_REWIND_ICON;
+
             active.add(countdown);
             active.add(rewind);
             return active;
         }
 
         if (specMode) {
-            // Specs do not have Utility; filter out slots with no icon/move so playable moves fill the wheel
-            for (int i = 1; i < 7; i++) { // HEAVY..ULTIMATE (exclude LIGHT=0 and UTILITY=7)
+            for (int i = 1; i < 7; i++) { // Exclude LIGHT (0) and UTILITY (7)
                 MoveSlotData d = slots[i];
-                if (d.present && (d.normalIcon != null || !d.normalDescription.isEmpty())) {
+                if (d.present && d.normalIcon != null) {
                     active.add(d);
                 }
             }
             if (active.isEmpty()) {
-                for (int i = 1; i < 6; i++) { // Fallback: HEAVY, BARRAGE, SP1, SP2, SP3
-                    if (slots[i].present || slots[i].normalIcon != null) {
-                        active.add(slots[i]);
-                    }
+                for (int i = 1; i < 7; i++) {
+                    if (slots[i].present) active.add(slots[i]);
                 }
             }
             if (active.isEmpty()) {
                 active.add(slots[WheelSlot.HEAVY.index]);
-                active.add(slots[WheelSlot.BARRAGE.index]);
                 active.add(slots[WheelSlot.SPECIAL1.index]);
+                active.add(slots[WheelSlot.SPECIAL2.index]);
             }
             return active;
         }
 
-        // Normal Stands: indices 1..7
         for (int i = 1; i < 8; i++) {
             if (slots[i].present) {
                 active.add(slots[i]);
@@ -156,14 +155,13 @@ public class WheelController {
 
     /**
      * Center hub icon:
-     * - For Mandom: uses Rewind icon (BARRAGE / ULTIMATE)
-     * - For all other Stands/Specs: uses Light Punch (M1) icon
+     * - Mandom: Rewind icon (`jcraft:textures/gui/ability_icons/mandom/ult.png`)
+     * - All other Stands/Specs: Light Punch (M1) icon
      */
     public MoveSlotData getCenterHubSlotData() {
         if (isCurrentMandom()) {
-            MoveSlotData rewind = slots[WheelSlot.BARRAGE.index];
-            if (rewind.normalIcon != null) return rewind;
-            if (slots[WheelSlot.ULTIMATE.index].normalIcon != null) return slots[WheelSlot.ULTIMATE.index];
+            MoveSlotData rewind = slots[WheelSlot.ULTIMATE.index];
+            if (rewind.normalIcon == null) rewind.normalIcon = MANDOM_REWIND_ICON;
             return rewind;
         }
         return slots[WheelSlot.LIGHT.index];
@@ -240,13 +238,28 @@ public class WheelController {
     public String getBoundKeyLabel(WheelSlot slot, boolean isSpec) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.options == null) return "";
-        KeyMapping km = findJCraftKeyMapping(mc, slot, isSpec);
-        if (km == null || km.isUnbound()) return "";
-        String label = km.getTranslatedKeyMessage().getString().trim();
-        if (label.isEmpty() || label.equalsIgnoreCase("key.keyboard.unknown") || label.equalsIgnoreCase("none")) {
-            return "";
+        String targetKeyName = switch (slot) {
+            case LIGHT -> "";
+            case HEAVY -> "key.jcraft.heavy";
+            case BARRAGE -> "key.jcraft.barrage";
+            case SPECIAL1 -> "key.jcraft.special1";
+            case SPECIAL2 -> "key.jcraft.special2";
+            case SPECIAL3 -> "key.jcraft.special3";
+            case ULTIMATE -> "key.jcraft.ultimate";
+            case UTILITY -> "key.jcraft.utility";
+        };
+        if (targetKeyName.isEmpty()) return "";
+        for (KeyMapping km : mc.options.keyMappings) {
+            if (km.getName().equalsIgnoreCase(targetKeyName)) {
+                if (km.isUnbound()) return "";
+                String label = km.getTranslatedKeyMessage().getString().trim();
+                if (label.isEmpty() || label.equalsIgnoreCase("key.keyboard.unknown") || label.equalsIgnoreCase("none")) {
+                    return "";
+                }
+                return label.toUpperCase(Locale.ROOT);
+            }
         }
-        return label.toUpperCase(Locale.ROOT);
+        return "";
     }
 
     @SubscribeEvent
@@ -258,24 +271,20 @@ public class WheelController {
             lastActiveEntityKey = "";
             hadSummonedEntity = false;
             hadStandPreviously = false;
-            pendingMoveSlot = null;
-            releaseActiveCast(mc);
+            heldCastSlot = null;
             return;
         }
 
-        // Preserve player crouch whenever Shift is physically held while Wheel is open!
+        // Keep player crouched while holding Shift + Wheel open
         boolean wheelScreenOpen = mc.screen instanceof WheelRadialScreen;
         if (wheelScreenOpen && mc.options != null) {
             mc.options.keyShift.setDown(isShiftHeldRaw());
         }
 
-        tickSimulatedCast(mc);
-        tickPendingMove(mc);
-
         boolean hasStand = JCraftStandCheck.hasStand(mc.player);
         boolean hasSpec = JCraftStandCheck.hasSpec(mc.player);
 
-        // Always default to STAND when player acquires a Stand (or has Stand and no explicit Spec switch)
+        // Default to STAND whenever player acquires/has a Stand
         if (hasStand && !hadStandPreviously) {
             specMode = false;
         } else if (!specMode && !hasStand && hasSpec) {
@@ -312,7 +321,10 @@ public class WheelController {
         if (mc.screen != null && !wheelScreenOpen) {
             xWasDown = false;
             castWasDown = false;
-            holdingCastKey = false;
+            if (heldCastSlot != null) {
+                CombinedNetwork.sendWheelHoldRelease(heldCastSlot.index, heldCastSpecMode);
+                heldCastSlot = null;
+            }
             return;
         }
 
@@ -320,7 +332,7 @@ public class WheelController {
             return;
         }
 
-        // 1. Handle X key (Tap = quick cycle, Hold = open Wheel without breaking Shift crouch!)
+        // 1. Handle X key (Tap = quick cycle, Hold = open Wheel while keeping Shift crouch!)
         boolean xDown = isWheelKeyHeldRaw();
         long now = System.currentTimeMillis();
 
@@ -337,7 +349,6 @@ public class WheelController {
                     }
                     boolean shiftBeforeOpen = isShiftHeldRaw();
                     mc.setScreen(new WheelRadialScreen(this));
-                    // Immediately restore Shift state after setScreen() calls KeyMapping.releaseAll()!
                     if (shiftBeforeOpen && mc.options != null) {
                         mc.options.keyShift.setDown(true);
                     }
@@ -351,17 +362,16 @@ public class WheelController {
         }
         xWasDown = xDown;
 
-        // 2. Handle C key (HOLDABLE cast for hold-type moves!)
+        // 2. Handle C key (Direct server execution + HOLD support!)
         boolean castDown = isCastKeyHeldRaw();
         if (castDown && !castWasDown && !wheelScreenOpen) {
-            holdingCastKey = true;
+            WheelSlot target = getSelectedWheelSlot();
             boolean shift = isShiftHeldRaw();
-            castSlot(getSelectedWheelSlot(), shift, true);
+            castSlot(target, shift, true);
         } else if (!castDown && castWasDown) {
-            holdingCastKey = false;
-            // Release held move key immediately when C is released (if min hold elapsed)
-            if (activeCastMinTicksRemaining <= 0) {
-                releaseActiveCast(mc);
+            if (heldCastSlot != null) {
+                CombinedNetwork.sendWheelHoldRelease(heldCastSlot.index, heldCastSpecMode);
+                heldCastSlot = null;
             }
         }
         castWasDown = castDown;
@@ -402,154 +412,19 @@ public class WheelController {
 
     public void castSlot(WheelSlot slot, boolean shiftRequested, boolean holdWhileC) {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player == null || mc.options == null || slot == null || slot == WheelSlot.LIGHT) return;
+        if (mc.player == null || slot == null || slot == WheelSlot.LIGHT) return;
 
         this.selectedWheelSlot = slot;
-
-        // Case A: In SPEC mode while a non-Mandom Stand is summoned -> desummon Stand first so Spec move executes cleanly without conflict!
-        if (specMode && JCraftStandCheck.hasStand(mc.player)
-                && JCraftStandCheck.getStandEntity(mc.player) != null
-                && !StandThemeRegistry.isMandom(JCraftStandCheck.getStandId(mc.player))) {
-            KeyMapping summonKey = findStandSummonKey(mc);
-            if (summonKey != null) {
-                tapKeyOnce(summonKey);
-                pendingMoveSlot = slot;
-                pendingMoveShift = shiftRequested;
-                pendingMoveHoldWhileC = holdWhileC;
-                pendingDelayTicks = 1;
-                return;
-            }
-        }
-
-        // Case B: In STAND mode while Stand is unsummoned -> summon + fire seamlessly with minimal 1-tick handoff!
-        if (!specMode && JCraftStandCheck.hasStand(mc.player) && JCraftStandCheck.getStandEntity(mc.player) == null) {
-            KeyMapping summonKey = findStandSummonKey(mc);
-            if (summonKey != null) {
-                tapKeyOnce(summonKey);
-                // Also fire immediately on next tick so player doesn't wait for a separate manual summon
-                pendingMoveSlot = slot;
-                pendingMoveShift = shiftRequested;
-                pendingMoveHoldWhileC = holdWhileC;
-                pendingDelayTicks = 1;
-                return;
-            }
-        }
-
-        executeCastNow(mc, slot, shiftRequested, holdWhileC);
-    }
-
-    private void tapKeyOnce(KeyMapping km) {
-        km.setDown(true);
-        KeyMapping.click(km.getKey());
-        km.setDown(false);
-    }
-
-    private void executeCastNow(Minecraft mc, WheelSlot slot, boolean shiftRequested, boolean holdWhileC) {
         MoveSlotData data = slots[slot.index];
         boolean useShift = shiftRequested && data.hasCrouchVariant;
 
-        KeyMapping jcraftKey = findJCraftKeyMapping(mc, slot, specMode);
-        if (jcraftKey != null) {
-            if (useShift && mc.options != null) {
-                mc.options.keyShift.setDown(true);
-            }
-            jcraftKey.setDown(true);
-            KeyMapping.click(jcraftKey.getKey());
-            activeCastKey = jcraftKey;
-            activeCastForceShift = useShift;
-            activeCastMinTicksRemaining = 2;
-            holdingCastKey = holdWhileC && isCastKeyHeldRaw();
-        }
-    }
+        // Send directly to server for 100% reliable SPECIAL1/2/3, instant Stand summon+cast, and Spec priority!
+        CombinedNetwork.sendWheelCast(slot.index, specMode, useShift, holdWhileC);
 
-    private void tickSimulatedCast(Minecraft mc) {
-        if (activeCastKey == null) return;
-        if (activeCastMinTicksRemaining > 0) {
-            activeCastMinTicksRemaining--;
+        if (holdWhileC) {
+            heldCastSlot = slot;
+            heldCastSpecMode = specMode;
         }
-        // Keep holding activeCastKey as long as C is physically held down!
-        if (holdingCastKey && isCastKeyHeldRaw()) {
-            activeCastKey.setDown(true);
-            if (activeCastForceShift && mc.options != null) {
-                mc.options.keyShift.setDown(true);
-            }
-            return;
-        }
-        if (activeCastMinTicksRemaining <= 0) {
-            releaseActiveCast(mc);
-        }
-    }
-
-    private void releaseActiveCast(Minecraft mc) {
-        if (activeCastKey != null) {
-            activeCastKey.setDown(false);
-            activeCastKey = null;
-        }
-        if (activeCastForceShift && mc != null && mc.options != null) {
-            mc.options.keyShift.setDown(isShiftHeldRaw());
-            activeCastForceShift = false;
-        }
-        holdingCastKey = false;
-    }
-
-    private void tickPendingMove(Minecraft mc) {
-        if (pendingMoveSlot == null) return;
-        if (pendingDelayTicks > 0) {
-            pendingDelayTicks--;
-            return;
-        }
-        WheelSlot toCast = pendingMoveSlot;
-        boolean shift = pendingMoveShift;
-        boolean holdC = pendingMoveHoldWhileC;
-        pendingMoveSlot = null;
-        pendingMoveShift = false;
-        pendingMoveHoldWhileC = false;
-        executeCastNow(mc, toCast, shift, holdC);
-    }
-
-    private KeyMapping findStandSummonKey(Minecraft mc) {
-        for (KeyMapping km : mc.options.keyMappings) {
-            String raw = km.getName().toLowerCase(Locale.ROOT);
-            String cat = km.getCategory().toLowerCase(Locale.ROOT);
-            if (!raw.contains("jcraft") && !cat.contains("jcraft")) continue;
-            if (raw.contains("summon") || raw.contains("stand_summon") || raw.contains("toggle_stand")) {
-                return km;
-            }
-        }
-        return null;
-    }
-
-    private KeyMapping findJCraftKeyMapping(Minecraft mc, WheelSlot slot, boolean isSpec) {
-        KeyMapping strictMatch = null;
-        KeyMapping neutralFallback = null;
-        for (KeyMapping km : mc.options.keyMappings) {
-            String raw = km.getName().toLowerCase(Locale.ROOT);
-            String cat = km.getCategory().toLowerCase(Locale.ROOT);
-            if (!raw.contains("jcraft") && !cat.contains("jcraft")) continue;
-
-            boolean matchesSlot = false;
-            for (String tok : slot.keybindTokens) {
-                if (raw.contains(tok)) {
-                    matchesSlot = true;
-                    break;
-                }
-            }
-            if (!matchesSlot) continue;
-
-            boolean keyIsSpec = raw.contains("spec");
-            boolean keyIsStand = raw.contains("stand");
-
-            if (isSpec) {
-                if (keyIsSpec) return km;
-                if (!keyIsStand && neutralFallback == null) neutralFallback = km;
-            } else {
-                if (!keyIsSpec) {
-                    if (keyIsStand) return km;
-                    if (strictMatch == null) strictMatch = km;
-                }
-            }
-        }
-        return isSpec ? neutralFallback : strictMatch;
     }
 
     @SubscribeEvent

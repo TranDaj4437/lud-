@@ -5,6 +5,9 @@ import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
@@ -23,6 +26,8 @@ import java.util.UUID;
 /**
  * Grants a configurable chance (default 35%) to roll an alternate Stand skin (1..3)
  * whenever a player obtains a new Stand via a JCraft Stand Arrow.
+ * Uses JCraft 0.18.2's real CommonStandComponent.setSkin(int) + sync(Entity),
+ * displays ONLY on the hotbar actionbar ("Skin #N - <Skin Name>"), and plays firework sounds!
  */
 public class StandArrowSkinHandler {
     private static volatile int altSkinChancePercent = 35;
@@ -43,8 +48,7 @@ public class StandArrowSkinHandler {
 
         String full = itemId.toString().toLowerCase(Locale.ROOT);
         if (full.contains("jcraft") && full.contains("arrow")) {
-            // Arm a 12-second window for Stand Arrow grant/evolution
-            arrowUseWindowEndMs.put(player.getUUID(), System.currentTimeMillis() + 12000L);
+            arrowUseWindowEndMs.put(player.getUUID(), System.currentTimeMillis() + 15000L);
         }
     }
 
@@ -53,13 +57,13 @@ public class StandArrowSkinHandler {
         if (event.phase != TickEvent.Phase.END) return;
         if (event.player.level().isClientSide()) return;
         if (!(event.player instanceof ServerPlayer player)) return;
-        if ((player.tickCount % 5) != 0) return;
+        if ((player.tickCount % 4) != 0) return;
 
         UUID uuid = player.getUUID();
-        String currentStand = JCraftStandCheck.getStandId(player);
+        String currentStand = JCraftStandCheck.getStandFullId(player);
         String previousStand = lastStandId.put(uuid, currentStand);
 
-        if (previousStand == null) return; // First tick on login
+        if (previousStand == null) return;
         if (currentStand.equals(previousStand)) return;
         if (!JCraftStandCheck.hasStand(player)) return;
 
@@ -69,12 +73,35 @@ public class StandArrowSkinHandler {
 
         if (altSkinChancePercent <= 0) return;
         if (random.nextInt(100) < altSkinChancePercent) {
-            int skinIndex = 1 + random.nextInt(3); // Alternate skins 1, 2, or 3
+            int skinIndex = 1 + random.nextInt(3); // Skins 1, 2, or 3
             if (applyStandSkin(player, skinIndex)) {
-                String standName = JCraftStandCheck.getStandDisplayName(player);
-                player.displayClientMessage(
-                        Component.literal("§6✦ Chúc mừng! Bạn đã nhận được §eSkin #" + skinIndex + " §6cho §b" + standName + "§6!"),
-                        false
+                // Build exact JCraft 0.18.2 skin translation key: entity.<ns>.<stand>.info.skin<N>
+                String ns = currentStand.contains(":") ? currentStand.substring(0, currentStand.indexOf(':')) : "jcraft";
+                String slug = currentStand.contains(":") ? currentStand.substring(currentStand.indexOf(':') + 1) : currentStand;
+                slug = slug.toLowerCase(Locale.ROOT).replace("_entity", "").replace("entity", "");
+                String langKey = "entity." + ns + "." + slug + ".info.skin" + skinIndex;
+
+                // Show ONLY on hotbar actionbar (actionBar = true, NO chat message!)
+                Component hotbarMsg = Component.literal("§6Skin #" + skinIndex + " §f- §e")
+                        .append(Component.translatable(langKey));
+                player.displayClientMessage(hotbarMsg, true);
+
+                // Play celebratory firework sounds!
+                player.level().playSound(
+                        null,
+                        player.blockPosition(),
+                        SoundEvents.FIREWORK_ROCKET_LAUNCH,
+                        SoundSource.PLAYERS,
+                        1.0F,
+                        1.05F
+                );
+                player.level().playSound(
+                        null,
+                        player.blockPosition(),
+                        SoundEvents.FIREWORK_ROCKET_TWINKLE,
+                        SoundSource.PLAYERS,
+                        1.0F,
+                        1.15F
                 );
             }
         }
@@ -115,20 +142,30 @@ public class StandArrowSkinHandler {
     private boolean applyStandSkin(ServerPlayer player, int skin) {
         Object standComp = JCraftStandCheck.getStandComponent(player);
         if (standComp == null) return false;
-        for (String mName : new String[]{"setSkin", "setStandSkin", "setSkinIndex"}) {
+        try {
+            // Exact JCraft 0.18.2 CommonStandComponent.setSkin(int)
+            Method setSkin = standComp.getClass().getMethod("setSkin", int.class);
+            setSkin.invoke(standComp, skin);
+
+            // Sync component to client via CommonStandComponentImpl.sync(Entity)
             try {
-                Method m = standComp.getClass().getMethod(mName, int.class);
-                m.invoke(standComp, skin);
-                // Try syncing if component exposes sync()
-                try {
-                    Method sync = standComp.getClass().getMethod("sync");
-                    sync.invoke(standComp);
-                } catch (Exception ignored) {
-                }
-                return true;
+                Method sync = standComp.getClass().getMethod("sync", Entity.class);
+                sync.invoke(standComp, player);
             } catch (Exception ignored) {
             }
+
+            // Also update currently summoned StandEntity if present
+            Object standEntity = JCraftStandCheck.getStandEntity(player);
+            if (standEntity != null) {
+                try {
+                    Method entitySetSkin = standEntity.getClass().getMethod("setSkin", int.class);
+                    entitySetSkin.invoke(standEntity, skin);
+                } catch (Exception ignored) {
+                }
+            }
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
-        return false;
     }
 }

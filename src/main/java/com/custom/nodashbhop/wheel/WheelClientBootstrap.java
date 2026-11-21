@@ -6,7 +6,7 @@ import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 
 /**
- * Isolated client-only bootstrapper for JCraft Ability Wheel v3.
+ * Isolated client-only bootstrapper for JCraft Ability Wheel v3.4.
  * Called strictly inside DistExecutor.unsafeRunWhenOn(Dist.CLIENT, ...).
  */
 public final class WheelClientBootstrap {
@@ -24,5 +24,6 @@ public final class WheelClientBootstrap {
         MinecraftForge.EVENT_BUS.register(controller);
         MinecraftForge.EVENT_BUS.register(controller.aboutParser);
         MinecraftForge.EVENT_BUS.register(new WheelHudOverlay(controller));
+        MinecraftForge.EVENT_BUS.register(new MandomAttackFixHandler(controller));
     }
 }

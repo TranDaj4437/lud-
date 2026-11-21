@@ -9,14 +9,24 @@ import java.lang.reflect.Method;
 import java.util.Locale;
 
 /**
- * Tracks live JCraft ability cooldowns for all wheel slots (Stand & Spec modes).
- * Automatically reflects JCraft Cooldown Cancel (RA) resets immediately onto the Wheel!
+ * Tracks live JCraft 0.18.2 ability cooldowns using exact CooldownType enum names:
+ * - Stand: STAND_LIGHT, STAND_HEAVY, STAND_BARRAGE, STAND_SP1, STAND_SP2, STAND_SP3, STAND_ULTIMATE, UTILITY
+ * - Spec:  LIGHT, HEAVY, BARRAGE, SPECIAL1, SPECIAL2, SPECIAL3, ULTIMATE, UTILITY
+ * Automatically clears immediately when JCraft Cooldown Cancel (RA) is used!
  */
 public class JCraftCooldownTracker {
+    private static final String[] STAND_CD_NAMES = {
+            "STAND_LIGHT", "STAND_HEAVY", "STAND_BARRAGE", "STAND_SP1",
+            "STAND_SP2", "STAND_SP3", "STAND_ULTIMATE", "UTILITY"
+    };
+
+    private static final String[] SPEC_CD_NAMES = {
+            "LIGHT", "HEAVY", "BARRAGE", "SPECIAL1",
+            "SPECIAL2", "SPECIAL3", "ULTIMATE", "UTILITY"
+    };
+
     private final int[] remainingTicks = new int[8];
     private final int[] maxTicks = new int[8];
-    private final int[] localFallbackTicks = new int[8];
-    private final int[] localFallbackMax = new int[8];
 
     private Class<?> cachedEnumCls = null;
     private boolean enumChecked = false;
@@ -30,7 +40,6 @@ public class JCraftCooldownTracker {
             return;
         }
 
-        // Detect JCraft Cooldown Cancel (RA) keypress to instantly clear wheel cooldown overlays
         Minecraft mc = Minecraft.getInstance();
         if (!cancelKeyScanned && mc.options != null) {
             cooldownCancelKey = findCooldownCancelKey(mc);
@@ -39,7 +48,7 @@ public class JCraftCooldownTracker {
         if (cooldownCancelKey != null) {
             boolean down = cooldownCancelKey.isDown();
             if (down && !cancelWasDown) {
-                clearNonUniversalFallback();
+                resetAll();
             }
             cancelWasDown = down;
         }
@@ -54,20 +63,15 @@ public class JCraftCooldownTracker {
                 ? cachedEnumCls.getEnumConstants()
                 : null;
 
-        for (WheelSlot slot : WheelSlot.values()) {
-            int i = slot.index;
-            if (localFallbackTicks[i] > 0) {
-                localFallbackTicks[i]--;
-            }
+        String[] names = specMode ? SPEC_CD_NAMES : STAND_CD_NAMES;
 
+        for (int i = 0; i < 8; i++) {
             int liveRem = 0;
             int liveMax = 0;
-            boolean hasLiveSource = false;
 
             if (cdComp != null && enumConstants != null) {
-                Object matched = matchCooldownEnum(enumConstants, slot, specMode);
+                Object matched = findEnumByName(enumConstants, names[i]);
                 if (matched != null) {
-                    hasLiveSource = true;
                     liveRem = invokeIntGetter(cdComp, cachedEnumCls, matched,
                             "getCooldown", "get", "getRemaining");
                     liveMax = invokeIntGetter(cdComp, cachedEnumCls, matched,
@@ -75,28 +79,16 @@ public class JCraftCooldownTracker {
                 }
             }
 
-            if (hasLiveSource) {
-                if (liveRem > 0) {
-                    remainingTicks[i] = liveRem;
-                    if (liveMax >= liveRem) {
-                        maxTicks[i] = liveMax;
-                    } else if (liveRem > maxTicks[i]) {
-                        maxTicks[i] = liveRem;
-                    }
-                    if (maxTicks[i] <= 0) {
-                        maxTicks[i] = liveRem;
-                    }
-                    localFallbackTicks[i] = 0;
-                } else {
-                    // Live component reports 0 (including right after Cooldown Cancel / RA!) -> clear immediately!
-                    remainingTicks[i] = 0;
-                    maxTicks[i] = 0;
-                    localFallbackTicks[i] = 0;
-                    localFallbackMax[i] = 0;
+            if (liveRem > 0) {
+                remainingTicks[i] = liveRem;
+                if (liveMax >= liveRem) {
+                    maxTicks[i] = liveMax;
+                } else if (liveRem > maxTicks[i]) {
+                    maxTicks[i] = liveRem;
                 }
-            } else if (localFallbackTicks[i] > 0) {
-                remainingTicks[i] = localFallbackTicks[i];
-                maxTicks[i] = Math.max(1, localFallbackMax[i]);
+                if (maxTicks[i] <= 0) {
+                    maxTicks[i] = liveRem;
+                }
             } else {
                 remainingTicks[i] = 0;
                 maxTicks[i] = 0;
@@ -107,18 +99,18 @@ public class JCraftCooldownTracker {
     private KeyMapping findCooldownCancelKey(Minecraft mc) {
         for (KeyMapping km : mc.options.keyMappings) {
             String raw = km.getName().toLowerCase(Locale.ROOT).replace("_", "").replace(".", "");
-            if (raw.contains("jcraft") && (raw.contains("cooldowncancel") || raw.contains("cdcancel"))) {
+            if (raw.contains("jcraft") && raw.contains("cooldowncancel")) {
                 return km;
             }
         }
         return null;
     }
 
-    public void clearNonUniversalFallback() {
-        for (int i = 0; i < 8; i++) {
-            localFallbackTicks[i] = 0;
-            localFallbackMax[i] = 0;
+    private Object findEnumByName(Object[] constants, String exactName) {
+        for (Object c : constants) {
+            if (c.toString().equalsIgnoreCase(exactName)) return c;
         }
+        return null;
     }
 
     public int getRemainingTicks(int slotIndex) {
@@ -151,32 +143,7 @@ public class JCraftCooldownTracker {
         for (int i = 0; i < 8; i++) {
             remainingTicks[i] = 0;
             maxTicks[i] = 0;
-            localFallbackTicks[i] = 0;
-            localFallbackMax[i] = 0;
         }
-    }
-
-    private Object matchCooldownEnum(Object[] constants, WheelSlot slot, boolean specMode) {
-        String prefix = specMode ? "SPEC_" : "STAND_";
-        for (String tok : slot.cooldownTokens) {
-            String upper = tok.toUpperCase(Locale.ROOT);
-            if (!upper.startsWith(prefix)) continue;
-            for (Object c : constants) {
-                if (c.toString().equalsIgnoreCase(upper)) return c;
-            }
-        }
-        for (String tok : slot.cooldownTokens) {
-            String upper = tok.toUpperCase(Locale.ROOT);
-            if (specMode && upper.startsWith("STAND_")) continue;
-            if (!specMode && upper.startsWith("SPEC_")) continue;
-            for (Object c : constants) {
-                String cname = c.toString().toUpperCase(Locale.ROOT);
-                if (cname.equals(upper) || cname.contains(upper)) {
-                    return c;
-                }
-            }
-        }
-        return null;
     }
 
     private int invokeIntGetter(Object target, Class<?> enumCls, Object enumVal, String... names) {
